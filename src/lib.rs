@@ -1,13 +1,14 @@
+mod handle;
+mod journal;
+mod runtime;
+
 use pyo3::prelude::*;
 
 /// A Python module implemented in Rust.
 #[pymodule]
 mod rust_python_lab {
-    use pyo3::prelude::*;
-
-    /// Formats the sum of two numbers as string.
-    #[pyfunction]
-    fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-        Ok((a + b).to_string())
-    }
+    #[pymodule_export]
+    use crate::handle::Handle;
+    #[pymodule_export]
+    use crate::runtime::Runtime;
 }
