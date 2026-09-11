@@ -5,6 +5,8 @@ pub enum TaskState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
+    TimedOut,
 }
 
 impl TaskState {
@@ -13,6 +15,8 @@ impl TaskState {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
         }
     }
 }
@@ -27,15 +31,8 @@ impl Journal {
         self.states.insert(id, TaskState::Running);
     }
 
-    pub fn finish(&mut self, id: u64, ok: bool) {
-        self.states.insert(
-            id,
-            if ok {
-                TaskState::Succeeded
-            } else {
-                TaskState::Failed
-            },
-        );
+    pub fn finish(&mut self, id: u64, state: TaskState) {
+        self.states.insert(id, state);
     }
 
     pub fn get(&self, id: u64) -> Option<TaskState> {

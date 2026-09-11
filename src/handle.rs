@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
+use tokio_util::sync::CancellationToken;
 
+use crate::bridge::cancel_asyncio_task;
 use crate::journal::Journal;
 
 /// Submitted work. Await this object to get the Python coroutine's result.
@@ -10,14 +12,27 @@ pub struct Handle {
     awaitable: Py<PyAny>,
     task_id: u64,
     journal: Arc<Mutex<Journal>>,
+    cancel: CancellationToken,
+    event_loop: Py<PyAny>,
+    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
 }
 
 impl Handle {
-    pub fn new(awaitable: Py<PyAny>, task_id: u64, journal: Arc<Mutex<Journal>>) -> Self {
+    pub fn new(
+        awaitable: Py<PyAny>,
+        task_id: u64,
+        journal: Arc<Mutex<Journal>>,
+        cancel: CancellationToken,
+        event_loop: Py<PyAny>,
+        py_task: Arc<Mutex<Option<Py<PyAny>>>>,
+    ) -> Self {
         Self {
             awaitable,
             task_id,
             journal,
+            cancel,
+            event_loop,
+            py_task,
         }
     }
 }
@@ -28,7 +43,22 @@ impl Handle {
         self.awaitable.bind(py).call_method0("__await__")
     }
 
-    /// `running`, `succeeded`, or `failed`.
+    /// Cancel this task: Tokio token and the asyncio Task, if it has started.
+    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+        self.cancel.cancel();
+        if let Some(task) = self.py_task.lock().ok().and_then(|guard| {
+            guard.as_ref().map(|task| task.clone_ref(py))
+        }) {
+            cancel_asyncio_task(&self.event_loop.bind(py), &task.bind(py))?;
+        }
+        Ok(())
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// `running`, `succeeded`, `failed`, `cancelled`, or `timed_out`.
     fn status(&self) -> String {
         self.journal
             .lock()
