@@ -35,6 +35,10 @@ impl Handle {
             py_task,
         }
     }
+
+    pub(crate) fn clone_awaitable(&self, py: Python<'_>) -> Py<PyAny> {
+        self.awaitable.clone_ref(py)
+    }
 }
 
 #[pymethods]
@@ -44,7 +48,7 @@ impl Handle {
     }
 
     /// Cancel this task: Tokio token and the asyncio Task, if it has started.
-    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn cancel(&self, py: Python<'_>) -> PyResult<()> {
         self.cancel.cancel();
         if let Some(task) = self.py_task.lock().ok().and_then(|guard| {
             guard.as_ref().map(|task| task.clone_ref(py))

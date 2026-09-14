@@ -183,6 +183,7 @@ name = "rust-python-lab"
 version = "0.1.0"
 dependencies = [
  "futures-channel",
+ "futures-util",
  "pyo3",
  "pyo3-async-runtimes",
  "tokio",
