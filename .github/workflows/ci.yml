@@ -28,7 +28,7 @@ jobs:
           VIRTUAL_ENV: ${{ github.workspace }}/.venv
 
       - name: Install test extras
-        run: .venv/bin/pip install pytest pytest-asyncio httpx
+        run: .venv/bin/pip install pytest pytest-asyncio httpx aiohttp
 
       - name: Test
         run: .venv/bin/pytest -q

@@ -1,3 +1,4 @@
+mod bridge;
 mod handle;
 mod journal;
 mod runtime;

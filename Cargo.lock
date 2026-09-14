@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -27,6 +33,12 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
 
 [[package]]
 name = "futures-task"
@@ -170,9 +182,11 @@ dependencies = [
 name = "rust-python-lab"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "pyo3",
  "pyo3-async-runtimes",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -228,6 +242,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
