@@ -16,6 +16,7 @@ class Counters:
     slow_completed: int = 0
     slow_exited: int = 0
     cancelled_handlers: int = 0
+    flaky_hits: int = 0
 
 
 def _enter(counters: Counters) -> None:
@@ -49,9 +50,17 @@ def create_app(counters: Counters) -> web.Application:
             counters.in_flight -= 1
             counters.slow_exited += 1
 
+    async def flaky(request: web.Request) -> web.Response:
+        fail_times = int(request.query.get("fail_times", "0"))
+        counters.flaky_hits += 1
+        if counters.flaky_hits <= fail_times:
+            return web.Response(status=500, text="fail")
+        return web.Response(text="ok")
+
     app = web.Application()
     app.router.add_get("/work", work)
     app.router.add_get("/slow", slow)
+    app.router.add_get("/flaky", flaky)
     return app
 
 
