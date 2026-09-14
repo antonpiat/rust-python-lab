@@ -58,7 +58,7 @@ impl Handle {
         self.cancel.is_cancelled()
     }
 
-    /// `running`, `succeeded`, `failed`, `cancelled`, or `timed_out`.
+    /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `timed_out`.
     fn status(&self) -> String {
         self.journal
             .lock()
@@ -66,5 +66,12 @@ impl Handle {
             .ok()
             .flatten()
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn done(&self) -> bool {
+        matches!(
+            self.status().as_str(),
+            "succeeded" | "failed" | "cancelled" | "timed_out"
+        )
     }
 }

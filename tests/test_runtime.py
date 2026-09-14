@@ -34,9 +34,10 @@ async def test_submit_propagates_error():
 async def test_handle_status_succeeded():
     rt = Runtime()
     handle = rt.submit(asyncio.sleep, 0)
-    assert handle.status() == "running"
+    assert handle.status() in {"queued", "running"}
     await handle
     assert handle.status() == "succeeded"
+    assert handle.done()
 
 
 async def test_handle_status_failed():
