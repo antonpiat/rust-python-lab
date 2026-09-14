@@ -17,6 +17,7 @@ class Counters:
     slow_exited: int = 0
     cancelled_handlers: int = 0
     flaky_hits: int = 0
+    sse_sent: int = 0
 
 
 def _enter(counters: Counters) -> None:
@@ -26,11 +27,12 @@ def _enter(counters: Counters) -> None:
 
 
 def create_app(counters: Counters) -> web.Application:
-    async def work(_request: web.Request) -> web.Response:
+    async def work(request: web.Request) -> web.Response:
+        delay = float(request.query.get("delay", "0.15"))
         counters.work_hits += 1
         _enter(counters)
         try:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(delay)
             return web.Response(text="ok")
         finally:
             counters.in_flight -= 1
@@ -57,10 +59,22 @@ def create_app(counters: Counters) -> web.Application:
             return web.Response(status=500, text="fail")
         return web.Response(text="ok")
 
+    async def sse(_request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse()
+        response.headers["Content-Type"] = "text/event-stream"
+        await response.prepare(_request)
+        for i in range(8):
+            await response.write(f"data: token-{i}\n\n".encode())
+            counters.sse_sent += 1
+            await asyncio.sleep(0.02)
+        await response.write_eof()
+        return response
+
     app = web.Application()
     app.router.add_get("/work", work)
     app.router.add_get("/slow", slow)
     app.router.add_get("/flaky", flaky)
+    app.router.add_get("/sse", sse)
     return app
 
 
@@ -78,3 +92,13 @@ async def http_get(url: str) -> str:
         response = await client.get(url, timeout=None)
         response.raise_for_status()
         return response.text
+
+
+async def sse_tokens(url: str):
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", url, timeout=None) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    yield line[6:]
+
