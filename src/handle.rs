@@ -4,14 +4,13 @@ use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::cancel_asyncio_task;
-use crate::journal::Journal;
+use crate::journal::TaskSlot;
 
 /// Submitted work. Await this object to get the Python coroutine's result.
 #[pyclass(frozen)]
 pub struct Handle {
     awaitable: Py<PyAny>,
-    task_id: u64,
-    journal: Arc<Mutex<Journal>>,
+    slot: Arc<TaskSlot>,
     cancel: CancellationToken,
     event_loop: Py<PyAny>,
     py_task: Arc<Mutex<Option<Py<PyAny>>>>,
@@ -20,16 +19,14 @@ pub struct Handle {
 impl Handle {
     pub fn new(
         awaitable: Py<PyAny>,
-        task_id: u64,
-        journal: Arc<Mutex<Journal>>,
+        slot: Arc<TaskSlot>,
         cancel: CancellationToken,
         event_loop: Py<PyAny>,
         py_task: Arc<Mutex<Option<Py<PyAny>>>>,
     ) -> Self {
         Self {
             awaitable,
-            task_id,
-            journal,
+            slot,
             cancel,
             event_loop,
             py_task,
@@ -63,19 +60,11 @@ impl Handle {
     }
 
     /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `timed_out`.
-    fn status(&self) -> String {
-        self.journal
-            .lock()
-            .map(|j| j.get(self.task_id).map(|s| s.as_str().to_string()))
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_string())
+    fn status(&self) -> &'static str {
+        self.slot.get().as_str()
     }
 
     fn done(&self) -> bool {
-        matches!(
-            self.status().as_str(),
-            "succeeded" | "failed" | "cancelled" | "timed_out"
-        )
+        self.slot.get().is_terminal()
     }
 }
