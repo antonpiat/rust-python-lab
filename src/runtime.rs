@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,11 +9,11 @@ use pyo3_async_runtimes::tokio::{
     future_into_py_with_locals, get_current_locals, get_runtime, scope,
 };
 use pyo3_async_runtimes::TaskLocals;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{cancelled_error, parse_timeout_secs, start_asyncio_task, wait_with_policy};
-use crate::error::QueueFull;
+use crate::error::{QueueFull, RuntimeClosed};
 use crate::handle::Handle;
 use crate::journal::{Journal, TaskState};
 use crate::policy::{OnFull, RetryConfig, RetryPolicy};
@@ -29,6 +29,63 @@ struct Inner {
     on_full: OnFull,
     default_timeout: Option<Duration>,
     retry: RetryConfig,
+    closed: AtomicBool,
+    ever_worked: AtomicBool,
+    work_count: AtomicUsize,
+    shutdown: CancellationToken,
+    work_started: Notify,
+    became_idle: Notify,
+    idle_ttl: Option<Duration>,
+}
+
+impl Inner {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn ensure_open(&self) -> PyResult<()> {
+        if self.is_closed() {
+            Err(RuntimeClosed::new_err("runtime is closed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_work(&self) {
+        self.ever_worked.store(true, Ordering::Release);
+        self.work_count.fetch_add(1, Ordering::SeqCst);
+        self.work_started.notify_waiters();
+    }
+
+    fn end_work(&self) {
+        let prev = self.work_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.became_idle.notify_waiters();
+        }
+    }
+}
+
+/// Drops `end_work` when the Tokio task finishes or the submit fails to spawn.
+struct WorkGuard {
+    inner: Arc<Inner>,
+}
+
+impl WorkGuard {
+    fn try_begin(inner: Arc<Inner>) -> PyResult<Self> {
+        inner.ensure_open()?;
+        inner.begin_work();
+        if inner.is_closed() {
+            inner.end_work();
+            return Err(RuntimeClosed::new_err("runtime is closed"));
+        }
+        Ok(Self { inner })
+    }
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.inner.end_work();
+    }
 }
 
 /// Tokio-backed execution controller. Python coroutine bodies still run on asyncio.
@@ -45,7 +102,8 @@ impl Runtime {
         queue_capacity=128,
         on_full=OnFull::REJECT,
         default_timeout=None,
-        retry=None
+        retry=None,
+        idle_ttl=None
     ))]
     fn new(
         max_concurrency: usize,
@@ -53,6 +111,7 @@ impl Runtime {
         on_full: OnFull,
         default_timeout: Option<f64>,
         retry: Option<Bound<'_, RetryPolicy>>,
+        idle_ttl: Option<f64>,
     ) -> PyResult<Self> {
         if max_concurrency == 0 {
             return Err(PyValueError::new_err("max_concurrency must be at least 1"));
@@ -62,20 +121,28 @@ impl Runtime {
             .ok_or_else(|| PyValueError::new_err("queue_capacity is too large"))?;
         let _ = get_runtime();
         let default_timeout = default_timeout.map(parse_timeout_secs).transpose()?;
+        let idle_ttl = idle_ttl.map(parse_timeout_secs).transpose()?;
         let retry = retry
             .map(|policy| RetryConfig::from_policy(&policy.borrow()))
             .unwrap_or_else(RetryConfig::none);
-        Ok(Self {
-            inner: Arc::new(Inner {
-                journal: Arc::new(Mutex::new(Journal::default())),
-                next_id: AtomicU64::new(1),
-                concurrency: Arc::new(Semaphore::new(max_concurrency)),
-                admission: Arc::new(Semaphore::new(admission_cap)),
-                on_full,
-                default_timeout,
-                retry,
-            }),
-        })
+        let inner = Arc::new(Inner {
+            journal: Arc::new(Mutex::new(Journal::default())),
+            next_id: AtomicU64::new(1),
+            concurrency: Arc::new(Semaphore::new(max_concurrency)),
+            admission: Arc::new(Semaphore::new(admission_cap)),
+            on_full,
+            default_timeout,
+            retry,
+            closed: AtomicBool::new(false),
+            ever_worked: AtomicBool::new(false),
+            work_count: AtomicUsize::new(0),
+            shutdown: CancellationToken::new(),
+            work_started: Notify::new(),
+            became_idle: Notify::new(),
+            idle_ttl,
+        });
+        spawn_idle_watcher(Arc::clone(&inner));
+        Ok(Self { inner })
     }
 
     /// Submit an async callable. Returns a Handle; await it for the result.
@@ -90,13 +157,14 @@ impl Runtime {
         args: Bound<'_, PyTuple>,
         timeout: Option<f64>,
     ) -> PyResult<Handle> {
+        self.inner.ensure_open()?;
         let locals = get_current_locals(py)?;
         let timeout = match timeout {
             Some(secs) => Some(parse_timeout_secs(secs)?),
             None => self.inner.default_timeout,
         };
         let args = args.unbind();
-        let cancel = CancellationToken::new();
+        let cancel = self.inner.shutdown.child_token();
         let py_task = Arc::new(Mutex::new(None));
         let event_loop = locals.event_loop(py).unbind();
 
@@ -109,6 +177,7 @@ impl Runtime {
             },
             OnFull::WAIT => None,
         };
+        let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
         let task_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -129,6 +198,7 @@ impl Runtime {
             py,
             locals.clone(),
             scope(locals.clone(), async move {
+                let _work = work;
                 let result = run_task(RunArgs {
                     locals,
                     func,
@@ -170,6 +240,7 @@ impl Runtime {
         tasks: Bound<'py, PyAny>,
         return_exceptions: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        slf.get().inner.ensure_open()?;
         let locals = get_current_locals(py)?;
         let specs = extract_tasks(&tasks)?;
         let mut handles = Vec::with_capacity(specs.len());
@@ -227,6 +298,7 @@ impl Runtime {
         py: Python<'py>,
         tasks: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, CompletionStream>> {
+        slf.get().inner.ensure_open()?;
         let locals = get_current_locals(py)?;
         let specs = extract_tasks(&tasks)?;
         let (tx, rx) = completion_channel(specs.len());
@@ -266,13 +338,14 @@ impl Runtime {
         if buffer == 0 {
             return Err(PyValueError::new_err("buffer must be at least 1"));
         }
+        self.inner.ensure_open()?;
         let locals = get_current_locals(py)?;
         let timeout = match timeout {
             Some(secs) => Some(parse_timeout_secs(secs)?),
             None => self.inner.default_timeout,
         };
         let args = args.unbind();
-        let cancel = CancellationToken::new();
+        let cancel = self.inner.shutdown.child_token();
         let py_task = Arc::new(Mutex::new(None));
         let event_loop = locals.event_loop(py).unbind();
         let (tx, rx) = item_channel(buffer);
@@ -284,6 +357,7 @@ impl Runtime {
             },
             OnFull::WAIT => None,
         };
+        let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
         let task_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -299,6 +373,7 @@ impl Runtime {
         let event_loop_for_run = event_loop.clone_ref(py);
 
         get_runtime().spawn(scope(locals.clone(), async move {
+            let _work = work;
             let result = run_stream(StreamArgs {
                 locals,
                 func,
@@ -343,6 +418,45 @@ impl Runtime {
         dict.set_item("timed_out", stats.timed_out)?;
         dict.set_item("completed", stats.completed())?;
         Ok(dict)
+    }
+
+    /// Stop admissions, wait for in-flight work up to `timeout`, then cancel the rest.
+    #[pyo3(signature = (timeout=None))]
+    fn shutdown<'py>(&self, py: Python<'py>, timeout: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = timeout.map(parse_timeout_secs).transpose()?;
+        let inner = Arc::clone(&self.inner);
+        let locals = get_current_locals(py)?;
+        future_into_py_with_locals(py, locals, async move {
+            drain_or_cancel(inner, timeout).await;
+            Ok(())
+        })
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn __aenter__<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        slf.get().inner.ensure_open()?;
+        let slf = slf.unbind();
+        let locals = get_current_locals(py)?;
+        future_into_py_with_locals(py, locals, async move { Ok(slf) })
+    }
+
+    #[pyo3(signature = (exc_type, exc, tb))]
+    fn __aexit__<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+        exc_type: Option<&Bound<'py, PyAny>>,
+        exc: Option<&Bound<'py, PyAny>>,
+        tb: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (exc_type, exc, tb);
+        slf.get().shutdown(py, None)
     }
 }
 
@@ -595,6 +709,84 @@ async fn run_stream(args: StreamArgs) -> PyResult<()> {
                 }
                 let _ = args.tx.send(Err(err)).await;
                 return Ok(());
+            }
+        }
+    }
+}
+
+fn spawn_idle_watcher(inner: Arc<Inner>) {
+    let Some(ttl) = inner.idle_ttl else {
+        return;
+    };
+    get_runtime().spawn(async move {
+        loop {
+            if inner.is_closed() {
+                return;
+            }
+            if inner.ever_worked.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = inner.work_started.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        loop {
+            if inner.is_closed() {
+                return;
+            }
+            if inner.work_count.load(Ordering::Acquire) > 0 {
+                tokio::select! {
+                    _ = inner.became_idle.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = inner.work_started.notified() => {}
+                _ = tokio::time::sleep(ttl) => {
+                    if inner.work_count.load(Ordering::Acquire) == 0 {
+                        inner.closed.store(true, Ordering::Release);
+                        inner.shutdown.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn drain_or_cancel(inner: Arc<Inner>, timeout: Option<Duration>) {
+    inner.closed.store(true, Ordering::Release);
+    if wait_until_idle(&inner, timeout).await {
+        return;
+    }
+    inner.shutdown.cancel();
+    let _ = wait_until_idle(&inner, Some(Duration::from_secs(5))).await;
+}
+
+async fn wait_until_idle(inner: &Inner, timeout: Option<Duration>) -> bool {
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+    loop {
+        if inner.work_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        match deadline {
+            None => {
+                tokio::select! {
+                    _ = inner.became_idle.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return inner.work_count.load(Ordering::Acquire) == 0;
+                }
+                tokio::select! {
+                    _ = inner.became_idle.notified() => {}
+                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(20))) => {}
+                }
             }
         }
     }
