@@ -11,13 +11,7 @@ use crate::bridge::{PyValue, PyValueResult};
 pub type ItemResult = PyValueResult;
 pub type CompletionItem = (usize, ItemResult);
 
-type ItemTx = mpsc::Sender<ItemResult>;
-type ItemRx = mpsc::Receiver<ItemResult>;
-type CompletionTx = mpsc::Sender<CompletionItem>;
-type CompletionRx = mpsc::Receiver<CompletionItem>;
-type ChannelRx<T> = mpsc::Receiver<T>;
-type LockedRx<T> = AsyncMutex<Option<ChannelRx<T>>>;
-type SharedRx<T> = Arc<LockedRx<T>>;
+type SharedRx<T> = Arc<AsyncMutex<Option<mpsc::Receiver<T>>>>;
 
 /// One finished gather/as_completed item, in completion order.
 #[pyclass(frozen)]
@@ -53,10 +47,8 @@ pub struct CompletionStream {
 }
 
 impl CompletionStream {
-    pub fn new(rx: CompletionRx) -> Self {
-        Self {
-            rx: Arc::new(AsyncMutex::new(Some(rx))),
-        }
+    pub fn new(rx: mpsc::Receiver<CompletionItem>) -> Self {
+        Self { rx: share_rx(rx) }
     }
 }
 
@@ -67,22 +59,12 @@ impl CompletionStream {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let locals = get_current_locals(py)?;
-        let rx = Arc::clone(&self.rx);
-        future_into_py_with_locals(py, locals, async move {
-            let mut guard = rx.lock().await;
-            let Some(channel) = guard.as_mut() else {
-                return Err(PyStopAsyncIteration::new_err(()));
-            };
-            match channel.recv().await {
-                Some((index, result)) => Python::attach(|py| {
-                    Ok(Bound::new(py, Completion::new(py, index, result))?.unbind())
-                }),
-                None => {
-                    *guard = None;
-                    Err(PyStopAsyncIteration::new_err(()))
-                }
-            }
+        poll_rx(py, Arc::clone(&self.rx), |(index, result)| {
+            Python::attach(|py| {
+                Ok(Bound::new(py, Completion::new(py, index, result))?
+                    .into_any()
+                    .unbind())
+            })
         })
     }
 }
@@ -94,9 +76,9 @@ pub struct ItemStream {
 }
 
 impl ItemStream {
-    pub fn new(rx: ItemRx, cancel: CancellationToken) -> Self {
+    pub fn new(rx: mpsc::Receiver<ItemResult>, cancel: CancellationToken) -> Self {
         Self {
-            rx: Arc::new(AsyncMutex::new(Some(rx))),
+            rx: share_rx(rx),
             cancel,
         }
     }
@@ -113,29 +95,41 @@ impl ItemStream {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let locals = get_current_locals(py)?;
-        let rx = Arc::clone(&self.rx);
-        future_into_py_with_locals(py, locals, async move {
-            let mut guard = rx.lock().await;
-            let Some(channel) = guard.as_mut() else {
-                return Err(PyStopAsyncIteration::new_err(()));
-            };
-            match channel.recv().await {
-                Some(Ok(value)) => Ok(value),
-                Some(Err(err)) => Err(err),
-                None => {
-                    *guard = None;
-                    Err(PyStopAsyncIteration::new_err(()))
-                }
-            }
-        })
+        poll_rx(py, Arc::clone(&self.rx), |result| result)
     }
 }
 
-pub fn item_channel(buffer: usize) -> (ItemTx, ItemRx) {
+pub fn item_channel(buffer: usize) -> (mpsc::Sender<ItemResult>, mpsc::Receiver<ItemResult>) {
     mpsc::channel(buffer.max(1))
 }
 
-pub fn completion_channel(n: usize) -> (CompletionTx, CompletionRx) {
+pub fn completion_channel(
+    n: usize,
+) -> (mpsc::Sender<CompletionItem>, mpsc::Receiver<CompletionItem>) {
     mpsc::channel(n.max(1))
+}
+
+fn share_rx<T>(rx: mpsc::Receiver<T>) -> SharedRx<T> {
+    Arc::new(AsyncMutex::new(Some(rx)))
+}
+
+fn poll_rx<'py, T, F>(py: Python<'py>, rx: SharedRx<T>, map: F) -> PyResult<Bound<'py, PyAny>>
+where
+    T: Send + 'static,
+    F: FnOnce(T) -> PyResult<PyValue> + Send + 'static,
+{
+    let locals = get_current_locals(py)?;
+    future_into_py_with_locals(py, locals, async move {
+        let mut guard = rx.lock().await;
+        let Some(channel) = guard.as_mut() else {
+            return Err(PyStopAsyncIteration::new_err(()));
+        };
+        match channel.recv().await {
+            Some(item) => map(item),
+            None => {
+                *guard = None;
+                Err(PyStopAsyncIteration::new_err(()))
+            }
+        }
+    })
 }
