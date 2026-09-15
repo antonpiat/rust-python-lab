@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,12 +64,7 @@ impl TaskSlot {
 
     fn transition(&self, from: TaskState, to: TaskState) -> bool {
         self.state
-            .compare_exchange(
-                from as u8,
-                to as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
