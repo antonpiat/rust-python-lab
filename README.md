@@ -96,10 +96,12 @@ python scripts/bench_fanout.py
 Skipped unless a key is present. CI never sets keys. Cheap smoke: 2–3 short prompts, `as_completed`, one token stream, one cancelled handle.
 
 ```bash
+cp examples/.env.example .env
+# uncomment and set OPENAI_API_KEY or ANTHROPIC_API_KEY
 python examples/live_llm.py
 ```
 
-Uses `OPENAI_API_KEY` (preferred) or `ANTHROPIC_API_KEY`. Optional `OPENAI_MODEL` / `ANTHROPIC_MODEL`. To also run it under pytest: `LIVE_LLM=1 pytest tests/test_examples.py`. Do not log secrets.
+Keys come from the process environment, then from `.env` in the repo root or `examples/.env`. Already-set env vars win. Optional `OPENAI_MODEL` / `ANTHROPIC_MODEL`. To also run it under pytest: `LIVE_LLM=1 pytest tests/test_examples.py`. Do not log secrets.
 
 ## What this does not prove
 
