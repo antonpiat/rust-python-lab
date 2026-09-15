@@ -9,9 +9,31 @@ use pyo3::types::PyDict;
 use pyo3_async_runtimes::TaskLocals;
 use tokio_util::sync::CancellationToken;
 
-static CANCELLED_EXC: OnceLock<Py<PyAny>> = OnceLock::new();
+pub type PyValue = Py<PyAny>;
+pub type PyValueResult = PyResult<PyValue>;
 
-fn cancelled_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+type PyBound<'py> = Bound<'py, PyAny>;
+type PyTaskCell = Option<PyValue>;
+type PyTaskLock = Mutex<PyTaskCell>;
+pub type SharedPyTask = Arc<PyTaskLock>;
+
+type TaskRx = oneshot::Receiver<PyValue>;
+type ResultRx = oneshot::Receiver<PyValueResult>;
+type TaskTx = oneshot::Sender<PyValue>;
+type ResultTx = oneshot::Sender<PyValueResult>;
+
+pub struct BridgedTask {
+    pub task_rx: TaskRx,
+    pub result_rx: ResultRx,
+}
+
+pub fn shared_py_task() -> SharedPyTask {
+    Arc::new(Mutex::new(None))
+}
+
+static CANCELLED_EXC: OnceLock<PyValue> = OnceLock::new();
+
+fn cancelled_type(py: Python<'_>) -> PyResult<PyBound<'_>> {
     if let Some(cls) = CANCELLED_EXC.get() {
         return Ok(cls.bind(py).clone());
     }
@@ -25,8 +47,8 @@ fn cancelled_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 pub fn start_asyncio_task(
     py: Python<'_>,
     locals: &TaskLocals,
-    awaitable: Bound<'_, PyAny>,
-) -> PyResult<(oneshot::Receiver<Py<PyAny>>, oneshot::Receiver<PyResult<Py<PyAny>>>)> {
+    awaitable: PyBound<'_>,
+) -> PyResult<BridgedTask> {
     let (task_tx, task_rx) = oneshot::channel();
     let (result_tx, result_rx) = oneshot::channel();
     let event_loop = locals.event_loop(py);
@@ -45,13 +67,10 @@ pub fn start_asyncio_task(
     kwargs.set_item("context", locals.context(py))?;
     event_loop.call_method("call_soon_threadsafe", (callback,), Some(&kwargs))?;
 
-    Ok((task_rx, result_rx))
+    Ok(BridgedTask { task_rx, result_rx })
 }
 
-pub fn cancel_asyncio_task(
-    event_loop: &Bound<'_, PyAny>,
-    task: &Bound<'_, PyAny>,
-) -> PyResult<()> {
+pub fn cancel_asyncio_task(event_loop: &PyBound<'_>, task: &PyBound<'_>) -> PyResult<()> {
     let cancel = task.getattr("cancel")?;
     event_loop.call_method1("call_soon_threadsafe", (cancel,))?;
     Ok(())
@@ -85,13 +104,13 @@ pub fn parse_timeout_secs(secs: f64) -> PyResult<Duration> {
 
 /// Cancels the asyncio task if the Tokio waiter is dropped mid-flight.
 pub struct CancelOnDrop {
-    event_loop: Py<PyAny>,
-    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
+    event_loop: PyValue,
+    py_task: SharedPyTask,
     armed: bool,
 }
 
 impl CancelOnDrop {
-    pub fn new(event_loop: Py<PyAny>, py_task: Arc<Mutex<Option<Py<PyAny>>>>) -> Self {
+    pub fn new(event_loop: PyValue, py_task: SharedPyTask) -> Self {
         Self {
             event_loop,
             py_task,
@@ -113,7 +132,7 @@ impl Drop for CancelOnDrop {
             return;
         };
         Python::attach(|py| {
-            let _ = cancel_asyncio_task(&self.event_loop.bind(py), &task.bind(py));
+            let _ = cancel_asyncio_task(self.event_loop.bind(py), task.bind(py));
         });
     }
 }
@@ -121,10 +140,10 @@ impl Drop for CancelOnDrop {
 pub async fn wait_with_policy(
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    result_rx: oneshot::Receiver<PyResult<Py<PyAny>>>,
-    event_loop: Py<PyAny>,
-    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
-) -> PyResult<Py<PyAny>> {
+    result_rx: ResultRx,
+    event_loop: PyValue,
+    py_task: SharedPyTask,
+) -> PyValueResult {
     let mut guard = CancelOnDrop::new(event_loop, py_task);
 
     let result = match timeout {
@@ -151,7 +170,7 @@ pub async fn wait_with_policy(
     result
 }
 
-fn map_oneshot(result: Result<PyResult<Py<PyAny>>, oneshot::Canceled>) -> PyResult<Py<PyAny>> {
+fn map_oneshot(result: Result<PyValueResult, oneshot::Canceled>) -> PyValueResult {
     match result {
         Ok(inner) => inner,
         Err(_) => Err(cancelled_error()),
@@ -160,10 +179,10 @@ fn map_oneshot(result: Result<PyResult<Py<PyAny>>, oneshot::Canceled>) -> PyResu
 
 #[pyclass]
 struct CaptureTask {
-    awaitable: Py<PyAny>,
-    event_loop: Py<PyAny>,
-    task_tx: Option<oneshot::Sender<Py<PyAny>>>,
-    result_tx: Option<oneshot::Sender<PyResult<Py<PyAny>>>>,
+    awaitable: PyValue,
+    event_loop: PyValue,
+    task_tx: Option<TaskTx>,
+    result_tx: Option<ResultTx>,
 }
 
 #[pymethods]
@@ -189,12 +208,12 @@ impl CaptureTask {
 
 #[pyclass]
 struct ResultCompleter {
-    tx: Option<oneshot::Sender<PyResult<Py<PyAny>>>>,
+    tx: Option<ResultTx>,
 }
 
 #[pymethods]
 impl ResultCompleter {
-    fn __call__(&mut self, task: Bound<'_, PyAny>) -> PyResult<()> {
+    fn __call__(&mut self, task: PyBound<'_>) -> PyResult<()> {
         let result = match task.call_method0("result") {
             Ok(value) => Ok(value.unbind()),
             Err(err) => Err(err),

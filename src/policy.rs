@@ -6,8 +6,10 @@ use pyo3::prelude::*;
 #[pyclass(eq, eq_int, frozen, from_py_object, name = "OnFull")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnFull {
-    REJECT,
-    WAIT,
+    #[pyo3(name = "REJECT")]
+    Reject,
+    #[pyo3(name = "WAIT")]
+    Wait,
 }
 
 #[pyclass(frozen, from_py_object)]
