@@ -12,17 +12,19 @@ use pyo3_async_runtimes::TaskLocals;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::{cancelled_error, parse_timeout_secs, start_asyncio_task, wait_with_policy};
+use crate::bridge::{
+    cancelled_error, is_cancelled, parse_timeout_secs, start_asyncio_task, wait_with_policy,
+};
 use crate::error::{QueueFull, RuntimeClosed};
 use crate::handle::Handle;
-use crate::journal::{Journal, TaskState};
+use crate::journal::{Journal, TaskSlot, TaskState};
 use crate::policy::{OnFull, RetryConfig, RetryPolicy};
 use crate::stream::{completion_channel, item_channel, CompletionStream, ItemStream};
 use crate::task::Task;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 struct Inner {
-    journal: Arc<Mutex<Journal>>,
+    journal: Journal,
     next_id: AtomicU64,
     concurrency: Arc<Semaphore>,
     admission: Arc<Semaphore>,
@@ -53,13 +55,12 @@ impl Inner {
 
     fn begin_work(&self) {
         self.ever_worked.store(true, Ordering::Release);
-        self.work_count.fetch_add(1, Ordering::SeqCst);
+        self.work_count.fetch_add(1, Ordering::Release);
         self.work_started.notify_waiters();
     }
 
     fn end_work(&self) {
-        let prev = self.work_count.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
+        if self.work_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.became_idle.notify_waiters();
         }
     }
@@ -126,7 +127,7 @@ impl Runtime {
             .map(|policy| RetryConfig::from_policy(&policy.borrow()))
             .unwrap_or_else(RetryConfig::none);
         let inner = Arc::new(Inner {
-            journal: Arc::new(Mutex::new(Journal::default())),
+            journal: Journal::default(),
             next_id: AtomicU64::new(1),
             concurrency: Arc::new(Semaphore::new(max_concurrency)),
             admission: Arc::new(Semaphore::new(admission_cap)),
@@ -141,7 +142,9 @@ impl Runtime {
             became_idle: Notify::new(),
             idle_ttl,
         });
-        spawn_idle_watcher(Arc::clone(&inner));
+        if inner.idle_ttl.is_some() {
+            spawn_idle_watcher(Arc::clone(&inner));
+        }
         Ok(Self { inner })
     }
 
@@ -180,52 +183,40 @@ impl Runtime {
         let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
         let task_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .journal
-            .lock()
-            .expect("journal mutex")
-            .insert_queued(task_id);
+        let slot = TaskSlot::queued();
+        self.inner.journal.insert_queued();
 
-        let journal = Arc::clone(&self.inner.journal);
-        let concurrency = Arc::clone(&self.inner.concurrency);
-        let admission = Arc::clone(&self.inner.admission);
-        let retry = self.inner.retry;
+        let inner = Arc::clone(&self.inner);
         let cancel_for_task = cancel.clone();
         let py_task_for_run = Arc::clone(&py_task);
         let event_loop_for_run = event_loop.clone_ref(py);
+        let slot_for_run = Arc::clone(&slot);
 
         let awaitable = future_into_py_with_locals(
             py,
             locals.clone(),
             scope(locals.clone(), async move {
                 let _work = work;
-                let result = run_task(RunArgs {
+                run_task(RunArgs {
+                    inner,
                     locals,
                     func,
                     args,
-                    admission,
                     admission_permit,
-                    concurrency,
                     cancel: cancel_for_task,
                     timeout,
-                    retry,
                     task_id,
-                    py_task: Arc::clone(&py_task_for_run),
+                    py_task: py_task_for_run,
                     event_loop: event_loop_for_run,
-                    journal: Arc::clone(&journal),
+                    slot: slot_for_run,
                 })
-                .await;
-                if let Ok(mut journal) = journal.lock() {
-                    journal.finish(task_id, state_for(&result));
-                }
-                result
+                .await
             }),
         )?;
 
         Ok(Handle::new(
             awaitable.unbind(),
-            task_id,
-            Arc::clone(&self.inner.journal),
+            slot,
             cancel,
             event_loop,
             py_task,
@@ -359,56 +350,36 @@ impl Runtime {
         };
         let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
-        let task_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .journal
-            .lock()
-            .expect("journal mutex")
-            .insert_queued(task_id);
+        let slot = TaskSlot::queued();
+        self.inner.journal.insert_queued();
 
-        let journal = Arc::clone(&self.inner.journal);
-        let concurrency = Arc::clone(&self.inner.concurrency);
-        let admission = Arc::clone(&self.inner.admission);
+        let inner = Arc::clone(&self.inner);
         let cancel_for_task = cancel.clone();
         let event_loop_for_run = event_loop.clone_ref(py);
 
         get_runtime().spawn(scope(locals.clone(), async move {
             let _work = work;
-            let result = run_stream(StreamArgs {
+            let _ = run_stream(StreamArgs {
+                inner,
                 locals,
                 func,
                 args,
-                admission,
                 admission_permit,
-                concurrency,
                 cancel: cancel_for_task,
                 timeout,
-                task_id,
                 py_task,
                 event_loop: event_loop_for_run,
-                journal: Arc::clone(&journal),
+                slot,
                 tx,
             })
             .await;
-            let state = match &result {
-                Ok(()) => TaskState::Succeeded,
-                Err(err) => state_for_err(err),
-            };
-            if let Ok(mut journal) = journal.lock() {
-                journal.finish(task_id, state);
-            }
         }));
 
         Ok(ItemStream::new(rx, cancel))
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = self
-            .inner
-            .journal
-            .lock()
-            .expect("journal mutex")
-            .stats();
+        let stats = self.inner.journal.stats();
         let dict = PyDict::new(py);
         dict.set_item("queued", stats.queued)?;
         dict.set_item("in_flight", stats.in_flight)?;
@@ -461,19 +432,17 @@ impl Runtime {
 }
 
 struct RunArgs {
+    inner: Arc<Inner>,
     locals: TaskLocals,
     func: Py<PyAny>,
     args: Py<PyTuple>,
-    admission: Arc<Semaphore>,
     admission_permit: Option<OwnedSemaphorePermit>,
-    concurrency: Arc<Semaphore>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    retry: RetryConfig,
     task_id: u64,
     py_task: Arc<Mutex<Option<Py<PyAny>>>>,
     event_loop: Py<PyAny>,
-    journal: Arc<Mutex<Journal>>,
+    slot: Arc<TaskSlot>,
 }
 
 fn state_for(result: &PyResult<Py<PyAny>>) -> TaskState {
@@ -495,40 +464,34 @@ fn state_for_err(err: &PyErr) -> TaskState {
     })
 }
 
-fn is_cancelled(py: Python<'_>, err: &PyErr) -> bool {
-    py.import("asyncio")
-        .and_then(|asyncio| asyncio.getattr("CancelledError"))
-        .map(|cls| err.is_instance(py, &cls))
-        .unwrap_or(false)
+async fn run_task(args: RunArgs) -> PyResult<Py<PyAny>> {
+    let slot = Arc::clone(&args.slot);
+    let inner = Arc::clone(&args.inner);
+    let result = run_task_inner(args).await;
+    inner.journal.finish(&slot, state_for(&result));
+    result
 }
 
-async fn run_task(args: RunArgs) -> PyResult<Py<PyAny>> {
+async fn run_task_inner(args: RunArgs) -> PyResult<Py<PyAny>> {
+    let retry = args.inner.retry;
     let _admission = match args.admission_permit {
         Some(permit) => permit,
-        None => acquire_permit(args.admission, &args.cancel).await?,
+        None => acquire_permit(Arc::clone(&args.inner.admission), &args.cancel).await?,
     };
-    if args.cancel.is_cancelled() {
-        return Err(cancelled_error());
-    }
+    let _concurrency = acquire_permit(Arc::clone(&args.inner.concurrency), &args.cancel).await?;
+    args.inner.journal.mark_running(&args.slot);
 
-    let _concurrency = acquire_permit(args.concurrency, &args.cancel).await?;
-    if args.cancel.is_cancelled() {
-        return Err(cancelled_error());
-    }
-    if let Ok(mut journal) = args.journal.lock() {
-        journal.mark_running(args.task_id);
-    }
-
-    let attempts = args.retry.max_attempts.max(1);
+    let attempts = retry.max_attempts.max(1);
     let mut last_err: Option<PyErr> = None;
     for attempt in 0..attempts {
         if args.cancel.is_cancelled() {
             return Err(cancelled_error());
         }
         if attempt > 0 {
-            let delay = args.retry.backoff_for(attempt, args.task_id);
+            let delay = retry.backoff_for(attempt, args.task_id);
             if !delay.is_zero() {
                 tokio::select! {
+                    biased;
                     _ = args.cancel.cancelled() => return Err(cancelled_error()),
                     _ = tokio::time::sleep(delay) => {}
                 }
@@ -543,18 +506,17 @@ async fn run_task(args: RunArgs) -> PyResult<Py<PyAny>> {
             &args.args,
             args.cancel.clone(),
             args.timeout,
-            Arc::clone(&args.py_task),
-            Python::attach(|py| args.event_loop.clone_ref(py)),
+            &args.py_task,
+            &args.event_loop,
         )
         .await
         {
             Ok(value) => return Ok(value),
             Err(err) => {
-                let retryable = Python::attach(|py| {
-                    !is_cancelled(py, &err)
-                });
+                let more = attempt + 1 < attempts
+                    && Python::attach(|py| !is_cancelled(py, &err));
                 last_err = Some(err);
-                if !retryable || attempt + 1 >= attempts {
+                if !more {
                     break;
                 }
             }
@@ -569,17 +531,19 @@ async fn run_once(
     args: &Py<PyTuple>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
-    event_loop: Py<PyAny>,
+    py_task: &Arc<Mutex<Option<Py<PyAny>>>>,
+    event_loop: &Py<PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    let (task_rx, result_rx) = Python::attach(|py| {
+    let (task_rx, result_rx, event_loop) = Python::attach(|py| -> PyResult<_> {
         let coro = func.bind(py).call(args.bind(py), None)?;
-        start_asyncio_task(py, locals, coro)
+        let (task_rx, result_rx) = start_asyncio_task(py, locals, coro)?;
+        Ok((task_rx, result_rx, event_loop.clone_ref(py)))
     })?;
 
     let started = tokio::select! {
-        _ = cancel.cancelled() => None,
+        biased;
         task = task_rx => task.ok(),
+        _ = cancel.cancelled() => None,
     };
     let Some(task) = started else {
         return Err(cancelled_error());
@@ -591,7 +555,7 @@ async fn run_once(
         return Err(cancelled_error());
     }
 
-    wait_with_policy(cancel, timeout, result_rx, event_loop, py_task).await
+    wait_with_policy(cancel, timeout, result_rx, event_loop, Arc::clone(py_task)).await
 }
 
 async fn acquire_permit(
@@ -599,6 +563,7 @@ async fn acquire_permit(
     cancel: &CancellationToken,
 ) -> PyResult<OwnedSemaphorePermit> {
     tokio::select! {
+        biased;
         _ = cancel.cancelled() => Err(cancelled_error()),
         permit = semaphore.acquire_owned() => {
             permit.map_err(|_| PyValueError::new_err("runtime semaphore closed"))
@@ -607,7 +572,8 @@ async fn acquire_permit(
 }
 
 fn extract_tasks(tasks: &Bound<'_, PyAny>) -> PyResult<Vec<Py<Task>>> {
-    let mut out = Vec::new();
+    let cap = tasks.len().unwrap_or(0);
+    let mut out = Vec::with_capacity(cap);
     for item in tasks.try_iter()? {
         out.push(item?.extract()?);
     }
@@ -625,36 +591,37 @@ fn submit_spec(rt: &Bound<'_, Runtime>, py: Python<'_>, spec: &Py<Task>) -> PyRe
 }
 
 struct StreamArgs {
+    inner: Arc<Inner>,
     locals: TaskLocals,
     func: Py<PyAny>,
     args: Py<PyTuple>,
-    admission: Arc<Semaphore>,
     admission_permit: Option<OwnedSemaphorePermit>,
-    concurrency: Arc<Semaphore>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    task_id: u64,
     py_task: Arc<Mutex<Option<Py<PyAny>>>>,
     event_loop: Py<PyAny>,
-    journal: Arc<Mutex<Journal>>,
+    slot: Arc<TaskSlot>,
     tx: tokio::sync::mpsc::Sender<PyResult<Py<PyAny>>>,
 }
 
 async fn run_stream(args: StreamArgs) -> PyResult<()> {
+    let slot = Arc::clone(&args.slot);
+    let inner = Arc::clone(&args.inner);
+    let result = run_stream_inner(args).await;
+    inner.journal.finish(&slot, match &result {
+        Ok(()) => TaskState::Succeeded,
+        Err(err) => state_for_err(err),
+    });
+    result
+}
+
+async fn run_stream_inner(args: StreamArgs) -> PyResult<()> {
     let _admission = match args.admission_permit {
         Some(permit) => permit,
-        None => acquire_permit(args.admission, &args.cancel).await?,
+        None => acquire_permit(Arc::clone(&args.inner.admission), &args.cancel).await?,
     };
-    if args.cancel.is_cancelled() {
-        return Err(cancelled_error());
-    }
-    let _concurrency = acquire_permit(args.concurrency, &args.cancel).await?;
-    if args.cancel.is_cancelled() {
-        return Err(cancelled_error());
-    }
-    if let Ok(mut journal) = args.journal.lock() {
-        journal.mark_running(args.task_id);
-    }
+    let _concurrency = acquire_permit(Arc::clone(&args.inner.concurrency), &args.cancel).await?;
+    args.inner.journal.mark_running(&args.slot);
 
     let agen = Python::attach(|py| {
         args.func
@@ -665,29 +632,34 @@ async fn run_stream(args: StreamArgs) -> PyResult<()> {
 
     loop {
         if args.cancel.is_cancelled() {
-            return Err(cancelled_error());
+            break Err(cancelled_error());
         }
         if args.tx.is_closed() {
-            return Ok(());
+            break Ok(());
         }
 
-        let (task_rx, result_rx) = Python::attach(|py| {
+        let started = Python::attach(|py| -> PyResult<_> {
             let next = agen.bind(py).call_method0("__anext__")?;
-            start_asyncio_task(py, &args.locals, next)
-        })?;
+            let (task_rx, result_rx) = start_asyncio_task(py, &args.locals, next)?;
+            Ok((task_rx, result_rx, args.event_loop.clone_ref(py)))
+        });
+        let (task_rx, result_rx, event_loop) = match started {
+            Ok(parts) => parts,
+            Err(err) => break Err(err),
+        };
 
         let started = tokio::select! {
-            _ = args.cancel.cancelled() => None,
+            biased;
             task = task_rx => task.ok(),
+            _ = args.cancel.cancelled() => None,
         };
         let Some(task) = started else {
-            return Err(cancelled_error());
+            break Err(cancelled_error());
         };
         if let Ok(mut slot) = args.py_task.lock() {
             *slot = Some(task);
         }
 
-        let event_loop = Python::attach(|py| args.event_loop.clone_ref(py));
         match wait_with_policy(
             args.cancel.clone(),
             args.timeout,
@@ -699,16 +671,16 @@ async fn run_stream(args: StreamArgs) -> PyResult<()> {
         {
             Ok(item) => {
                 if args.tx.send(Ok(item)).await.is_err() {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             Err(err) => {
                 let stop = Python::attach(|py| err.is_instance_of::<PyStopAsyncIteration>(py));
                 if stop {
-                    return Ok(());
+                    break Ok(());
                 }
                 let _ = args.tx.send(Err(err)).await;
-                return Ok(());
+                break Ok(());
             }
         }
     }
@@ -719,31 +691,23 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
         return;
     };
     get_runtime().spawn(async move {
-        loop {
-            if inner.is_closed() {
-                return;
-            }
-            if inner.ever_worked.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::select! {
-                _ = inner.work_started.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
+        if !wait_flag(&inner, || inner.ever_worked.load(Ordering::Acquire)).await {
+            return;
         }
         loop {
             if inner.is_closed() {
                 return;
             }
             if inner.work_count.load(Ordering::Acquire) > 0 {
-                tokio::select! {
-                    _ = inner.became_idle.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                if !wait_idle_signal(&inner).await {
+                    return;
                 }
                 continue;
             }
             tokio::select! {
-                _ = inner.work_started.notified() => {}
+                biased;
+                _ = inner.shutdown.cancelled() => return,
+                _ = wait_work_started(&inner) => {}
                 _ = tokio::time::sleep(ttl) => {
                     if inner.work_count.load(Ordering::Acquire) == 0 {
                         inner.closed.store(true, Ordering::Release);
@@ -754,6 +718,57 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
             }
         }
     });
+}
+
+async fn wait_flag(inner: &Inner, ready: impl Fn() -> bool) -> bool {
+    loop {
+        if inner.is_closed() {
+            return false;
+        }
+        let notified = inner.work_started.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if ready() {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = inner.shutdown.cancelled() => return false,
+            _ = notified => {}
+        }
+    }
+}
+
+async fn wait_work_started(inner: &Inner) {
+    let notified = inner.work_started.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if inner.work_count.load(Ordering::Acquire) > 0 {
+        return;
+    }
+    notified.await;
+}
+
+async fn wait_idle_signal(inner: &Inner) -> bool {
+    loop {
+        if inner.is_closed() {
+            return false;
+        }
+        if inner.work_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        let notified = inner.became_idle.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if inner.work_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = inner.shutdown.cancelled() => return false,
+            _ = notified => {}
+        }
+    }
 }
 
 async fn drain_or_cancel(inner: Arc<Inner>, timeout: Option<Duration>) {
@@ -771,21 +786,21 @@ async fn wait_until_idle(inner: &Inner, timeout: Option<Duration>) -> bool {
         if inner.work_count.load(Ordering::Acquire) == 0 {
             return true;
         }
+        let notified = inner.became_idle.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if inner.work_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
         match deadline {
-            None => {
-                tokio::select! {
-                    _ = inner.became_idle.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-                }
-            }
+            None => notified.await,
             Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return inner.work_count.load(Ordering::Acquire) == 0;
-                }
                 tokio::select! {
-                    _ = inner.became_idle.notified() => {}
-                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(20))) => {}
+                    biased;
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return inner.work_count.load(Ordering::Acquire) == 0;
+                    }
                 }
             }
         }
