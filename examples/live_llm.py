@@ -2,7 +2,12 @@
 
 Never required for CI. Uses httpx (no official SDKs, no LangChain).
 
+    cp examples/.env.example .env   # or examples/.env
+    # put a key in the file, then:
     python examples/live_llm.py
+
+Keys can also come from the process environment. Existing env vars win
+over the file. Set LIVE_LLM_NO_DOTENV=1 to ignore .env files.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 import httpx
 
@@ -18,6 +24,8 @@ from rust_python_lab import Runtime, Task
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 PROMPTS = (
     "Reply with the single word ping.",
     "Reply with the single word pong.",
@@ -25,7 +33,35 @@ PROMPTS = (
 )
 
 
+def _apply_dotenv(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def load_env() -> None:
+    if os.environ.get("LIVE_LLM_NO_DOTENV"):
+        return
+    _apply_dotenv(ROOT / ".env")
+    _apply_dotenv(HERE / ".env")
+
+
 def _provider() -> str | None:
+    load_env()
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
     if os.environ.get("ANTHROPIC_API_KEY"):
@@ -140,7 +176,10 @@ async def anthropic_tokens(prompt: str):
 async def main() -> int:
     provider = _provider()
     if provider is None:
-        print("skip: set OPENAI_API_KEY or ANTHROPIC_API_KEY to run the live LLM smoke")
+        print(
+            "skip: set OPENAI_API_KEY or ANTHROPIC_API_KEY "
+            "(env or .env / examples/.env; see examples/.env.example)"
+        )
         return 0
 
     complete = openai_complete if provider == "openai" else anthropic_complete

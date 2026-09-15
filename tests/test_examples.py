@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -31,10 +32,31 @@ def test_agent_tools_example():
     assert "llm tokens:" in result.stdout
 
 
-def test_live_llm_skips_without_keys(monkeypatch: pytest.MonkeyPatch):
+def test_live_llm_dotenv_fills_missing_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "live_llm", ROOT / "examples" / "live_llm.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    env_file = tmp_path / ".env"
+    env_file.write_text('OPENAI_API_KEY="sk-test"\nOPENAI_MODEL=gpt-test\n')
+    mod._apply_dotenv(env_file)
+    assert os.environ["OPENAI_API_KEY"] == "sk-test"
+    assert os.environ["OPENAI_MODEL"] == "gpt-test"
+    monkeypatch.setenv("OPENAI_API_KEY", "already-set")
+    env_file.write_text("OPENAI_API_KEY=from-file\n")
+    mod._apply_dotenv(env_file)
+    assert os.environ["OPENAI_API_KEY"] == "already-set"
+
+
+def test_live_llm_skips_without_keys():
     env = os.environ.copy()
     env.pop("OPENAI_API_KEY", None)
     env.pop("ANTHROPIC_API_KEY", None)
+    env["LIVE_LLM_NO_DOTENV"] = "1"
     result = subprocess.run(
         [sys.executable, str(ROOT / "examples" / "live_llm.py")],
         cwd=ROOT,
