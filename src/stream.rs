@@ -3,8 +3,21 @@ use std::sync::Arc;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{future_into_py_with_locals, get_current_locals};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use crate::bridge::{PyValue, PyValueResult};
+
+pub type ItemResult = PyValueResult;
+pub type CompletionItem = (usize, ItemResult);
+
+type ItemTx = mpsc::Sender<ItemResult>;
+type ItemRx = mpsc::Receiver<ItemResult>;
+type CompletionTx = mpsc::Sender<CompletionItem>;
+type CompletionRx = mpsc::Receiver<CompletionItem>;
+type ChannelRx<T> = mpsc::Receiver<T>;
+type LockedRx<T> = AsyncMutex<Option<ChannelRx<T>>>;
+type SharedRx<T> = Arc<LockedRx<T>>;
 
 /// One finished gather/as_completed item, in completion order.
 #[pyclass(frozen)]
@@ -14,11 +27,11 @@ pub struct Completion {
     #[pyo3(get)]
     ok: bool,
     #[pyo3(get)]
-    value: Py<PyAny>,
+    value: PyValue,
 }
 
 impl Completion {
-    pub fn new(py: Python<'_>, index: usize, result: PyResult<Py<PyAny>>) -> Self {
+    pub fn new(py: Python<'_>, index: usize, result: ItemResult) -> Self {
         match result {
             Ok(value) => Self {
                 index,
@@ -36,13 +49,13 @@ impl Completion {
 
 #[pyclass]
 pub struct CompletionStream {
-    rx: Arc<Mutex<Option<mpsc::Receiver<(usize, PyResult<Py<PyAny>>)>>>>,
+    rx: SharedRx<CompletionItem>,
 }
 
 impl CompletionStream {
-    pub fn new(rx: mpsc::Receiver<(usize, PyResult<Py<PyAny>>)>) -> Self {
+    pub fn new(rx: CompletionRx) -> Self {
         Self {
-            rx: Arc::new(Mutex::new(Some(rx))),
+            rx: Arc::new(AsyncMutex::new(Some(rx))),
         }
     }
 }
@@ -74,18 +87,16 @@ impl CompletionStream {
     }
 }
 
-pub type ItemResult = PyResult<Py<PyAny>>;
-
 #[pyclass]
 pub struct ItemStream {
-    rx: Arc<Mutex<Option<mpsc::Receiver<ItemResult>>>>,
+    rx: SharedRx<ItemResult>,
     cancel: CancellationToken,
 }
 
 impl ItemStream {
-    pub fn new(rx: mpsc::Receiver<ItemResult>, cancel: CancellationToken) -> Self {
+    pub fn new(rx: ItemRx, cancel: CancellationToken) -> Self {
         Self {
-            rx: Arc::new(Mutex::new(Some(rx))),
+            rx: Arc::new(AsyncMutex::new(Some(rx))),
             cancel,
         }
     }
@@ -121,15 +132,10 @@ impl ItemStream {
     }
 }
 
-pub fn item_channel(buffer: usize) -> (mpsc::Sender<ItemResult>, mpsc::Receiver<ItemResult>) {
+pub fn item_channel(buffer: usize) -> (ItemTx, ItemRx) {
     mpsc::channel(buffer.max(1))
 }
 
-pub fn completion_channel(
-    n: usize,
-) -> (
-    mpsc::Sender<(usize, PyResult<Py<PyAny>>)>,
-    mpsc::Receiver<(usize, PyResult<Py<PyAny>>)>,
-) {
+pub fn completion_channel(n: usize) -> (CompletionTx, CompletionRx) {
     mpsc::channel(n.max(1))
 }

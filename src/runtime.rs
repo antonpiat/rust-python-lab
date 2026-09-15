@@ -1,25 +1,26 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pyo3::exceptions::{PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3_async_runtimes::TaskLocals;
 use pyo3_async_runtimes::tokio::{
     future_into_py_with_locals, get_current_locals, get_runtime, scope,
 };
-use pyo3_async_runtimes::TaskLocals;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{
-    cancelled_error, is_cancelled, parse_timeout_secs, start_asyncio_task, wait_with_policy,
+    PyValue, PyValueResult, SharedPyTask, cancelled_error, is_cancelled, parse_timeout_secs,
+    shared_py_task, start_asyncio_task, wait_with_policy,
 };
 use crate::error::{QueueFull, RuntimeClosed};
 use crate::handle::Handle;
 use crate::journal::{Journal, TaskSlot, TaskState};
 use crate::policy::{OnFull, RetryConfig, RetryPolicy};
-use crate::stream::{completion_channel, item_channel, CompletionStream, ItemStream};
+use crate::stream::{CompletionStream, ItemResult, ItemStream, completion_channel, item_channel};
 use crate::task::Task;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
@@ -101,7 +102,7 @@ impl Runtime {
     #[pyo3(signature = (
         max_concurrency=32,
         queue_capacity=128,
-        on_full=OnFull::REJECT,
+        on_full=OnFull::Reject,
         default_timeout=None,
         retry=None,
         idle_ttl=None
@@ -168,17 +169,17 @@ impl Runtime {
         };
         let args = args.unbind();
         let cancel = self.inner.shutdown.child_token();
-        let py_task = Arc::new(Mutex::new(None));
+        let py_task = shared_py_task();
         let event_loop = locals.event_loop(py).unbind();
 
         let admission_permit = match self.inner.on_full {
-            OnFull::REJECT => match Arc::clone(&self.inner.admission).try_acquire_owned() {
+            OnFull::Reject => match Arc::clone(&self.inner.admission).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
                     return Err(QueueFull::new_err("admission queue is full"));
                 }
             },
-            OnFull::WAIT => None,
+            OnFull::Wait => None,
         };
         let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
@@ -245,42 +246,38 @@ impl Runtime {
             handles.push(handle);
             futs.push(fut);
         }
-        future_into_py_with_locals(
-            py,
-            locals,
-            async move {
-                let n = futs.len();
-                let mut pending = FuturesUnordered::new();
-                for (index, fut) in futs.into_iter().enumerate() {
-                    pending.push(async move { (index, fut.await) });
-                }
-                let mut slots: Vec<Option<PyResult<Py<PyAny>>>> = (0..n).map(|_| None).collect();
-                while let Some((index, result)) = pending.next().await {
-                    match result {
-                        Ok(value) => slots[index] = Some(Ok(value)),
-                        Err(err) if return_exceptions => slots[index] = Some(Err(err)),
-                        Err(err) => {
-                            Python::attach(|py| {
-                                for handle in &handles {
-                                    let _ = handle.cancel(py);
-                                }
-                            });
-                            return Err(err);
-                        }
+        future_into_py_with_locals(py, locals, async move {
+            let n = futs.len();
+            let mut pending = FuturesUnordered::new();
+            for (index, fut) in futs.into_iter().enumerate() {
+                pending.push(async move { (index, fut.await) });
+            }
+            let mut slots: Vec<Option<PyValueResult>> = (0..n).map(|_| None).collect();
+            while let Some((index, result)) = pending.next().await {
+                match result {
+                    Ok(value) => slots[index] = Some(Ok(value)),
+                    Err(err) if return_exceptions => slots[index] = Some(Err(err)),
+                    Err(err) => {
+                        Python::attach(|py| {
+                            for handle in &handles {
+                                let _ = handle.cancel(py);
+                            }
+                        });
+                        return Err(err);
                     }
                 }
-                Python::attach(|py| {
-                    let list = PyList::empty(py);
-                    for slot in slots {
-                        match slot.unwrap_or_else(|| Err(cancelled_error())) {
-                            Ok(value) => list.append(value.bind(py))?,
-                            Err(err) => list.append(err.value(py))?,
-                        }
+            }
+            Python::attach(|py| {
+                let list = PyList::empty(py);
+                for slot in slots {
+                    match slot.unwrap_or_else(|| Err(cancelled_error())) {
+                        Ok(value) => list.append(value.bind(py))?,
+                        Err(err) => list.append(err.value(py))?,
                     }
-                    Ok(list.unbind().into_any())
-                })
-            },
-        )
+                }
+                Ok(list.unbind().into_any())
+            })
+        })
     }
 
     /// Yield `Completion` items as tasks finish (out of order).
@@ -337,16 +334,16 @@ impl Runtime {
         };
         let args = args.unbind();
         let cancel = self.inner.shutdown.child_token();
-        let py_task = Arc::new(Mutex::new(None));
+        let py_task = shared_py_task();
         let event_loop = locals.event_loop(py).unbind();
         let (tx, rx) = item_channel(buffer);
 
         let admission_permit = match self.inner.on_full {
-            OnFull::REJECT => match Arc::clone(&self.inner.admission).try_acquire_owned() {
+            OnFull::Reject => match Arc::clone(&self.inner.admission).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => return Err(QueueFull::new_err("admission queue is full")),
             },
-            OnFull::WAIT => None,
+            OnFull::Wait => None,
         };
         let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
 
@@ -408,10 +405,7 @@ impl Runtime {
         self.inner.is_closed()
     }
 
-    fn __aenter__<'py>(
-        slf: Bound<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         slf.get().inner.ensure_open()?;
         let slf = slf.unbind();
         let locals = get_current_locals(py)?;
@@ -434,18 +428,18 @@ impl Runtime {
 struct RunArgs {
     inner: Arc<Inner>,
     locals: TaskLocals,
-    func: Py<PyAny>,
+    func: PyValue,
     args: Py<PyTuple>,
     admission_permit: Option<OwnedSemaphorePermit>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
     task_id: u64,
-    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
-    event_loop: Py<PyAny>,
+    py_task: SharedPyTask,
+    event_loop: PyValue,
     slot: Arc<TaskSlot>,
 }
 
-fn state_for(result: &PyResult<Py<PyAny>>) -> TaskState {
+fn state_for(result: &PyValueResult) -> TaskState {
     match result {
         Ok(_) => TaskState::Succeeded,
         Err(err) => state_for_err(err),
@@ -464,7 +458,7 @@ fn state_for_err(err: &PyErr) -> TaskState {
     })
 }
 
-async fn run_task(args: RunArgs) -> PyResult<Py<PyAny>> {
+async fn run_task(args: RunArgs) -> PyValueResult {
     let slot = Arc::clone(&args.slot);
     let inner = Arc::clone(&args.inner);
     let result = run_task_inner(args).await;
@@ -472,7 +466,7 @@ async fn run_task(args: RunArgs) -> PyResult<Py<PyAny>> {
     result
 }
 
-async fn run_task_inner(args: RunArgs) -> PyResult<Py<PyAny>> {
+async fn run_task_inner(args: RunArgs) -> PyValueResult {
     let retry = args.inner.retry;
     let _admission = match args.admission_permit {
         Some(permit) => permit,
@@ -513,8 +507,7 @@ async fn run_task_inner(args: RunArgs) -> PyResult<Py<PyAny>> {
         {
             Ok(value) => return Ok(value),
             Err(err) => {
-                let more = attempt + 1 < attempts
-                    && Python::attach(|py| !is_cancelled(py, &err));
+                let more = attempt + 1 < attempts && Python::attach(|py| !is_cancelled(py, &err));
                 last_err = Some(err);
                 if !more {
                     break;
@@ -527,17 +520,17 @@ async fn run_task_inner(args: RunArgs) -> PyResult<Py<PyAny>> {
 
 async fn run_once(
     locals: &TaskLocals,
-    func: &Py<PyAny>,
+    func: &PyValue,
     args: &Py<PyTuple>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    py_task: &Arc<Mutex<Option<Py<PyAny>>>>,
-    event_loop: &Py<PyAny>,
-) -> PyResult<Py<PyAny>> {
+    py_task: &SharedPyTask,
+    event_loop: &PyValue,
+) -> PyValueResult {
     let (task_rx, result_rx, event_loop) = Python::attach(|py| -> PyResult<_> {
         let coro = func.bind(py).call(args.bind(py), None)?;
-        let (task_rx, result_rx) = start_asyncio_task(py, locals, coro)?;
-        Ok((task_rx, result_rx, event_loop.clone_ref(py)))
+        let bridged = start_asyncio_task(py, locals, coro)?;
+        Ok((bridged.task_rx, bridged.result_rx, event_loop.clone_ref(py)))
     })?;
 
     let started = tokio::select! {
@@ -593,25 +586,28 @@ fn submit_spec(rt: &Bound<'_, Runtime>, py: Python<'_>, spec: &Py<Task>) -> PyRe
 struct StreamArgs {
     inner: Arc<Inner>,
     locals: TaskLocals,
-    func: Py<PyAny>,
+    func: PyValue,
     args: Py<PyTuple>,
     admission_permit: Option<OwnedSemaphorePermit>,
     cancel: CancellationToken,
     timeout: Option<Duration>,
-    py_task: Arc<Mutex<Option<Py<PyAny>>>>,
-    event_loop: Py<PyAny>,
+    py_task: SharedPyTask,
+    event_loop: PyValue,
     slot: Arc<TaskSlot>,
-    tx: tokio::sync::mpsc::Sender<PyResult<Py<PyAny>>>,
+    tx: tokio::sync::mpsc::Sender<ItemResult>,
 }
 
 async fn run_stream(args: StreamArgs) -> PyResult<()> {
     let slot = Arc::clone(&args.slot);
     let inner = Arc::clone(&args.inner);
     let result = run_stream_inner(args).await;
-    inner.journal.finish(&slot, match &result {
-        Ok(()) => TaskState::Succeeded,
-        Err(err) => state_for_err(err),
-    });
+    inner.journal.finish(
+        &slot,
+        match &result {
+            Ok(()) => TaskState::Succeeded,
+            Err(err) => state_for_err(err),
+        },
+    );
     result
 }
 
@@ -640,8 +636,12 @@ async fn run_stream_inner(args: StreamArgs) -> PyResult<()> {
 
         let started = Python::attach(|py| -> PyResult<_> {
             let next = agen.bind(py).call_method0("__anext__")?;
-            let (task_rx, result_rx) = start_asyncio_task(py, &args.locals, next)?;
-            Ok((task_rx, result_rx, args.event_loop.clone_ref(py)))
+            let bridged = start_asyncio_task(py, &args.locals, next)?;
+            Ok((
+                bridged.task_rx,
+                bridged.result_rx,
+                args.event_loop.clone_ref(py),
+            ))
         });
         let (task_rx, result_rx, event_loop) = match started {
             Ok(parts) => parts,
