@@ -1,3 +1,4 @@
+use std::future::pending;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,18 +14,16 @@ pub type PyValue = Py<PyAny>;
 pub type PyValueResult = PyResult<PyValue>;
 
 type PyBound<'py> = Bound<'py, PyAny>;
-type PyTaskCell = Option<PyValue>;
-type PyTaskLock = Mutex<PyTaskCell>;
-pub type SharedPyTask = Arc<PyTaskLock>;
+pub type SharedPyTask = Arc<Mutex<Option<PyValue>>>;
 
 type TaskRx = oneshot::Receiver<PyValue>;
 type ResultRx = oneshot::Receiver<PyValueResult>;
 type TaskTx = oneshot::Sender<PyValue>;
 type ResultTx = oneshot::Sender<PyValueResult>;
 
-pub struct BridgedTask {
-    pub task_rx: TaskRx,
-    pub result_rx: ResultRx,
+struct BridgedTask {
+    task_rx: TaskRx,
+    result_rx: ResultRx,
 }
 
 pub fn shared_py_task() -> SharedPyTask {
@@ -43,8 +42,7 @@ fn cancelled_type(py: Python<'_>) -> PyResult<PyBound<'_>> {
     Ok(cls)
 }
 
-/// Schedule `awaitable` on the captured asyncio loop and keep the Task so we can cancel it.
-pub fn start_asyncio_task(
+fn start_asyncio_task(
     py: Python<'_>,
     locals: &TaskLocals,
     awaitable: PyBound<'_>,
@@ -102,15 +100,14 @@ pub fn parse_timeout_secs(secs: f64) -> PyResult<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-/// Cancels the asyncio task if the Tokio waiter is dropped mid-flight.
-pub struct CancelOnDrop {
+struct CancelOnDrop {
     event_loop: PyValue,
     py_task: SharedPyTask,
     armed: bool,
 }
 
 impl CancelOnDrop {
-    pub fn new(event_loop: PyValue, py_task: SharedPyTask) -> Self {
+    fn new(event_loop: PyValue, py_task: SharedPyTask) -> Self {
         Self {
             event_loop,
             py_task,
@@ -118,7 +115,7 @@ impl CancelOnDrop {
         }
     }
 
-    pub fn disarm(&mut self) {
+    fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -137,33 +134,49 @@ impl Drop for CancelOnDrop {
     }
 }
 
-pub async fn wait_with_policy(
-    cancel: CancellationToken,
+/// Schedule a Python awaitable on asyncio and wait for it under cancel/timeout.
+pub async fn await_bridged(
+    locals: &TaskLocals,
+    cancel: &CancellationToken,
     timeout: Option<Duration>,
-    result_rx: ResultRx,
-    event_loop: PyValue,
-    py_task: SharedPyTask,
+    py_task: &SharedPyTask,
+    event_loop: &PyValue,
+    make_awaitable: impl FnOnce(Python<'_>) -> PyValueResult,
 ) -> PyValueResult {
-    let mut guard = CancelOnDrop::new(event_loop, py_task);
+    let (task_rx, result_rx, event_loop) = Python::attach(|py| -> PyResult<_> {
+        let awaitable = make_awaitable(py)?.into_bound(py);
+        let bridged = start_asyncio_task(py, locals, awaitable)?;
+        Ok((bridged.task_rx, bridged.result_rx, event_loop.clone_ref(py)))
+    })?;
 
-    let result = match timeout {
-        Some(duration) => {
-            tokio::select! {
-                biased;
-                result = result_rx => map_oneshot(result),
-                _ = cancel.cancelled() => Err(cancelled_error()),
-                _ = tokio::time::sleep(duration) => Err(timeout_error()),
-            }
-        }
-        None => {
-            tokio::select! {
-                biased;
-                result = result_rx => map_oneshot(result),
-                _ = cancel.cancelled() => Err(cancelled_error()),
-            }
+    let started = tokio::select! {
+        biased;
+        task = task_rx => task.ok(),
+        _ = cancel.cancelled() => None,
+    };
+    let Some(task) = started else {
+        return Err(cancelled_error());
+    };
+    if let Ok(mut slot) = py_task.lock() {
+        *slot = Some(task);
+    }
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
+    }
+
+    let mut guard = CancelOnDrop::new(event_loop, Arc::clone(py_task));
+    let sleep = async {
+        match timeout {
+            Some(duration) => tokio::time::sleep(duration).await,
+            None => pending().await,
         }
     };
-
+    let result = tokio::select! {
+        biased;
+        result = result_rx => map_oneshot(result),
+        _ = cancel.cancelled() => Err(cancelled_error()),
+        _ = sleep => Err(timeout_error()),
+    };
     if result.is_ok() {
         guard.disarm();
     }

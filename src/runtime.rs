@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -13,8 +14,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{
-    PyValue, PyValueResult, SharedPyTask, cancelled_error, is_cancelled, parse_timeout_secs,
-    shared_py_task, start_asyncio_task, wait_with_policy,
+    PyValue, PyValueResult, SharedPyTask, await_bridged, cancelled_error, is_cancelled,
+    parse_timeout_secs, shared_py_task,
 };
 use crate::error::{QueueFull, RuntimeClosed};
 use crate::handle::Handle;
@@ -65,6 +66,29 @@ impl Inner {
             self.became_idle.notify_waiters();
         }
     }
+
+    fn resolve_timeout(&self, timeout: Option<f64>) -> PyResult<Option<Duration>> {
+        match timeout {
+            Some(secs) => parse_timeout_secs(secs).map(Some),
+            None => Ok(self.default_timeout),
+        }
+    }
+
+    fn try_admit(&self) -> PyResult<Option<OwnedSemaphorePermit>> {
+        match self.on_full {
+            OnFull::Reject => match Arc::clone(&self.admission).try_acquire_owned() {
+                Ok(permit) => Ok(Some(permit)),
+                Err(_) => Err(QueueFull::new_err("admission queue is full")),
+            },
+            OnFull::Wait => Ok(None),
+        }
+    }
+
+    fn queue_slot(&self) -> Arc<TaskSlot> {
+        let slot = TaskSlot::queued();
+        self.journal.insert_queued();
+        slot
+    }
 }
 
 /// Drops `end_work` when the Tokio task finishes or the submit fails to spawn.
@@ -90,10 +114,86 @@ impl Drop for WorkGuard {
     }
 }
 
+struct Admitted {
+    locals: TaskLocals,
+    args: Py<PyTuple>,
+    cancel: CancellationToken,
+    timeout: Option<Duration>,
+    py_task: SharedPyTask,
+    event_loop: PyValue,
+    admission_permit: Option<OwnedSemaphorePermit>,
+    work: WorkGuard,
+    slot: Arc<TaskSlot>,
+    task_id: u64,
+}
+
+impl Admitted {
+    fn into_ctx(self, inner: Arc<Inner>, func: PyValue) -> (WorkGuard, WorkCtx) {
+        (
+            self.work,
+            WorkCtx {
+                inner,
+                locals: self.locals,
+                func,
+                args: self.args,
+                admission_permit: self.admission_permit,
+                cancel: self.cancel,
+                timeout: self.timeout,
+                py_task: self.py_task,
+                event_loop: self.event_loop,
+                slot: self.slot,
+                task_id: self.task_id,
+            },
+        )
+    }
+}
+
+struct WorkCtx {
+    inner: Arc<Inner>,
+    locals: TaskLocals,
+    func: PyValue,
+    args: Py<PyTuple>,
+    admission_permit: Option<OwnedSemaphorePermit>,
+    cancel: CancellationToken,
+    timeout: Option<Duration>,
+    py_task: SharedPyTask,
+    event_loop: PyValue,
+    slot: Arc<TaskSlot>,
+    task_id: u64,
+}
+
 /// Tokio-backed execution controller. Python coroutine bodies still run on asyncio.
 #[pyclass(frozen)]
 pub struct Runtime {
     inner: Arc<Inner>,
+}
+
+impl Runtime {
+    fn admit(
+        &self,
+        py: Python<'_>,
+        args: Bound<'_, PyTuple>,
+        timeout: Option<f64>,
+    ) -> PyResult<Admitted> {
+        self.inner.ensure_open()?;
+        let locals = get_current_locals(py)?;
+        let timeout = self.inner.resolve_timeout(timeout)?;
+        let admission_permit = self.inner.try_admit()?;
+        let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
+        let event_loop = locals.event_loop(py).unbind();
+        Ok(Admitted {
+            locals,
+            args: args.unbind(),
+            cancel: self.inner.shutdown.child_token(),
+            timeout,
+            py_task: shared_py_task(),
+            event_loop,
+            admission_permit,
+            work,
+            slot: self.inner.queue_slot(),
+            task_id: self.inner.next_id.fetch_add(1, Ordering::Relaxed),
+        })
+    }
 }
 
 #[pymethods]
@@ -161,57 +261,20 @@ impl Runtime {
         args: Bound<'_, PyTuple>,
         timeout: Option<f64>,
     ) -> PyResult<Handle> {
-        self.inner.ensure_open()?;
-        let locals = get_current_locals(py)?;
-        let timeout = match timeout {
-            Some(secs) => Some(parse_timeout_secs(secs)?),
-            None => self.inner.default_timeout,
-        };
-        let args = args.unbind();
-        let cancel = self.inner.shutdown.child_token();
-        let py_task = shared_py_task();
-        let event_loop = locals.event_loop(py).unbind();
-
-        let admission_permit = match self.inner.on_full {
-            OnFull::Reject => match Arc::clone(&self.inner.admission).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(QueueFull::new_err("admission queue is full"));
-                }
-            },
-            OnFull::Wait => None,
-        };
-        let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
-
-        let task_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let slot = TaskSlot::queued();
-        self.inner.journal.insert_queued();
-
-        let inner = Arc::clone(&self.inner);
-        let cancel_for_task = cancel.clone();
-        let py_task_for_run = Arc::clone(&py_task);
-        let event_loop_for_run = event_loop.clone_ref(py);
-        let slot_for_run = Arc::clone(&slot);
+        let admitted = self.admit(py, args, timeout)?;
+        let cancel = admitted.cancel.clone();
+        let py_task = Arc::clone(&admitted.py_task);
+        let event_loop = admitted.event_loop.clone_ref(py);
+        let slot = Arc::clone(&admitted.slot);
+        let locals = admitted.locals.clone();
+        let (work, ctx) = admitted.into_ctx(Arc::clone(&self.inner), func);
 
         let awaitable = future_into_py_with_locals(
             py,
             locals.clone(),
-            scope(locals.clone(), async move {
+            scope(locals, async move {
                 let _work = work;
-                run_task(RunArgs {
-                    inner,
-                    locals,
-                    func,
-                    args,
-                    admission_permit,
-                    cancel: cancel_for_task,
-                    timeout,
-                    task_id,
-                    py_task: py_task_for_run,
-                    event_loop: event_loop_for_run,
-                    slot: slot_for_run,
-                })
-                .await
+                run_work(ctx, run_task_inner).await
             }),
         )?;
 
@@ -232,27 +295,16 @@ impl Runtime {
         tasks: Bound<'py, PyAny>,
         return_exceptions: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        slf.get().inner.ensure_open()?;
-        let locals = get_current_locals(py)?;
-        let specs = extract_tasks(&tasks)?;
-        let mut handles = Vec::with_capacity(specs.len());
-        let mut futs = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let handle = submit_spec(slf, py, &spec)?;
-            let fut = pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                handle.clone_awaitable(py).into_bound(py),
-            )?;
-            handles.push(handle);
-            futs.push(fut);
+        let (locals, handles) = submit_all(slf, py, &tasks)?;
+        let mut futs = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            futs.push(handle_future(py, &locals, handle)?);
         }
         future_into_py_with_locals(py, locals, async move {
             let n = futs.len();
-            let mut pending = FuturesUnordered::new();
-            for (index, fut) in futs.into_iter().enumerate() {
-                pending.push(async move { (index, fut.await) });
-            }
-            let mut slots: Vec<Option<PyValueResult>> = (0..n).map(|_| None).collect();
+            let mut pending = indexed_set(futs);
+            let mut slots = Vec::with_capacity(n);
+            slots.resize_with(n, || None);
             while let Some((index, result)) = pending.next().await {
                 match result {
                     Ok(value) => slots[index] = Some(Ok(value)),
@@ -286,24 +338,14 @@ impl Runtime {
         py: Python<'py>,
         tasks: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, CompletionStream>> {
-        slf.get().inner.ensure_open()?;
-        let locals = get_current_locals(py)?;
-        let specs = extract_tasks(&tasks)?;
-        let (tx, rx) = completion_channel(specs.len());
-        let mut waiters = Vec::with_capacity(specs.len());
-        for (index, spec) in specs.into_iter().enumerate() {
-            let handle = submit_spec(slf, py, &spec)?;
-            let fut = pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                handle.clone_awaitable(py).into_bound(py),
-            )?;
-            waiters.push((index, fut));
+        let (locals, handles) = submit_all(slf, py, &tasks)?;
+        let (tx, rx) = completion_channel(handles.len());
+        let mut futs = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            futs.push(handle_future(py, &locals, handle)?);
         }
         get_runtime().spawn(async move {
-            let mut set = FuturesUnordered::new();
-            for (index, fut) in waiters {
-                set.push(async move { (index, fut.await) });
-            }
+            let mut set = indexed_set(futs);
             while let Some(item) = set.next().await {
                 if tx.send(item).await.is_err() {
                     break;
@@ -326,52 +368,14 @@ impl Runtime {
         if buffer == 0 {
             return Err(PyValueError::new_err("buffer must be at least 1"));
         }
-        self.inner.ensure_open()?;
-        let locals = get_current_locals(py)?;
-        let timeout = match timeout {
-            Some(secs) => Some(parse_timeout_secs(secs)?),
-            None => self.inner.default_timeout,
-        };
-        let args = args.unbind();
-        let cancel = self.inner.shutdown.child_token();
-        let py_task = shared_py_task();
-        let event_loop = locals.event_loop(py).unbind();
+        let admitted = self.admit(py, args, timeout)?;
         let (tx, rx) = item_channel(buffer);
-
-        let admission_permit = match self.inner.on_full {
-            OnFull::Reject => match Arc::clone(&self.inner.admission).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => return Err(QueueFull::new_err("admission queue is full")),
-            },
-            OnFull::Wait => None,
-        };
-        let work = WorkGuard::try_begin(Arc::clone(&self.inner))?;
-
-        let slot = TaskSlot::queued();
-        self.inner.journal.insert_queued();
-
-        let inner = Arc::clone(&self.inner);
-        let cancel_for_task = cancel.clone();
-        let event_loop_for_run = event_loop.clone_ref(py);
-
-        get_runtime().spawn(scope(locals.clone(), async move {
+        let cancel = admitted.cancel.clone();
+        let (work, ctx) = admitted.into_ctx(Arc::clone(&self.inner), func);
+        get_runtime().spawn(scope(ctx.locals.clone(), async move {
             let _work = work;
-            let _ = run_stream(StreamArgs {
-                inner,
-                locals,
-                func,
-                args,
-                admission_permit,
-                cancel: cancel_for_task,
-                timeout,
-                py_task,
-                event_loop: event_loop_for_run,
-                slot,
-                tx,
-            })
-            .await;
+            let _ = run_work(ctx, |ctx| run_stream_inner(ctx, tx)).await;
         }));
-
         Ok(ItemStream::new(rx, cancel))
     }
 
@@ -425,86 +429,69 @@ impl Runtime {
     }
 }
 
-struct RunArgs {
-    inner: Arc<Inner>,
-    locals: TaskLocals,
-    func: PyValue,
-    args: Py<PyTuple>,
-    admission_permit: Option<OwnedSemaphorePermit>,
-    cancel: CancellationToken,
-    timeout: Option<Duration>,
-    task_id: u64,
-    py_task: SharedPyTask,
-    event_loop: PyValue,
-    slot: Arc<TaskSlot>,
-}
-
-fn state_for(result: &PyValueResult) -> TaskState {
+fn state_from_result<T>(result: &PyResult<T>) -> TaskState {
     match result {
         Ok(_) => TaskState::Succeeded,
-        Err(err) => state_for_err(err),
+        Err(err) => Python::attach(|py| {
+            if err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py) {
+                TaskState::TimedOut
+            } else if is_cancelled(py, err) {
+                TaskState::Cancelled
+            } else {
+                TaskState::Failed
+            }
+        }),
     }
 }
 
-fn state_for_err(err: &PyErr) -> TaskState {
-    Python::attach(|py| {
-        if err.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py) {
-            TaskState::TimedOut
-        } else if is_cancelled(py, err) {
-            TaskState::Cancelled
-        } else {
-            TaskState::Failed
-        }
-    })
-}
-
-async fn run_task(args: RunArgs) -> PyValueResult {
-    let slot = Arc::clone(&args.slot);
-    let inner = Arc::clone(&args.inner);
-    let result = run_task_inner(args).await;
-    inner.journal.finish(&slot, state_for(&result));
+async fn run_work<T, F, Fut>(ctx: WorkCtx, run: F) -> PyResult<T>
+where
+    F: FnOnce(WorkCtx) -> Fut,
+    Fut: Future<Output = PyResult<T>>,
+{
+    let slot = Arc::clone(&ctx.slot);
+    let inner = Arc::clone(&ctx.inner);
+    let result = run(ctx).await;
+    inner.journal.finish(&slot, state_from_result(&result));
     result
 }
 
-async fn run_task_inner(args: RunArgs) -> PyValueResult {
-    let retry = args.inner.retry;
-    let _admission = match args.admission_permit {
+async fn acquire_execution(
+    ctx: &mut WorkCtx,
+) -> PyResult<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+    let admission = match ctx.admission_permit.take() {
         Some(permit) => permit,
-        None => acquire_permit(Arc::clone(&args.inner.admission), &args.cancel).await?,
+        None => acquire_permit(Arc::clone(&ctx.inner.admission), &ctx.cancel).await?,
     };
-    let _concurrency = acquire_permit(Arc::clone(&args.inner.concurrency), &args.cancel).await?;
-    args.inner.journal.mark_running(&args.slot);
+    let concurrency = acquire_permit(Arc::clone(&ctx.inner.concurrency), &ctx.cancel).await?;
+    ctx.inner.journal.mark_running(&ctx.slot);
+    Ok((admission, concurrency))
+}
+
+async fn run_task_inner(mut ctx: WorkCtx) -> PyValueResult {
+    let retry = ctx.inner.retry;
+    let _permits = acquire_execution(&mut ctx).await?;
 
     let attempts = retry.max_attempts.max(1);
     let mut last_err: Option<PyErr> = None;
     for attempt in 0..attempts {
-        if args.cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return Err(cancelled_error());
         }
         if attempt > 0 {
-            let delay = retry.backoff_for(attempt, args.task_id);
+            if let Ok(mut slot) = ctx.py_task.lock() {
+                *slot = None;
+            }
+            let delay = retry.backoff_for(attempt, ctx.task_id);
             if !delay.is_zero() {
                 tokio::select! {
                     biased;
-                    _ = args.cancel.cancelled() => return Err(cancelled_error()),
+                    _ = ctx.cancel.cancelled() => return Err(cancelled_error()),
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
         }
-        if let Ok(mut slot) = args.py_task.lock() {
-            *slot = None;
-        }
-        match run_once(
-            &args.locals,
-            &args.func,
-            &args.args,
-            args.cancel.clone(),
-            args.timeout,
-            &args.py_task,
-            &args.event_loop,
-        )
-        .await
-        {
+        match await_call(&ctx).await {
             Ok(value) => return Ok(value),
             Err(err) => {
                 let more = attempt + 1 < attempts && Python::attach(|py| !is_cancelled(py, &err));
@@ -518,37 +505,28 @@ async fn run_task_inner(args: RunArgs) -> PyValueResult {
     Err(last_err.unwrap_or_else(cancelled_error))
 }
 
-async fn run_once(
-    locals: &TaskLocals,
-    func: &PyValue,
-    args: &Py<PyTuple>,
-    cancel: CancellationToken,
-    timeout: Option<Duration>,
-    py_task: &SharedPyTask,
-    event_loop: &PyValue,
-) -> PyValueResult {
-    let (task_rx, result_rx, event_loop) = Python::attach(|py| -> PyResult<_> {
-        let coro = func.bind(py).call(args.bind(py), None)?;
-        let bridged = start_asyncio_task(py, locals, coro)?;
-        Ok((bridged.task_rx, bridged.result_rx, event_loop.clone_ref(py)))
-    })?;
+async fn await_call(ctx: &WorkCtx) -> PyValueResult {
+    await_bridged(
+        &ctx.locals,
+        &ctx.cancel,
+        ctx.timeout,
+        &ctx.py_task,
+        &ctx.event_loop,
+        |py| Ok(ctx.func.bind(py).call(ctx.args.bind(py), None)?.unbind()),
+    )
+    .await
+}
 
-    let started = tokio::select! {
-        biased;
-        task = task_rx => task.ok(),
-        _ = cancel.cancelled() => None,
-    };
-    let Some(task) = started else {
-        return Err(cancelled_error());
-    };
-    if let Ok(mut slot) = py_task.lock() {
-        *slot = Some(task);
-    }
-    if cancel.is_cancelled() {
-        return Err(cancelled_error());
-    }
-
-    wait_with_policy(cancel, timeout, result_rx, event_loop, Arc::clone(py_task)).await
+async fn await_anext(ctx: &WorkCtx, agen: &PyValue) -> PyValueResult {
+    await_bridged(
+        &ctx.locals,
+        &ctx.cancel,
+        ctx.timeout,
+        &ctx.py_task,
+        &ctx.event_loop,
+        |py| Ok(agen.bind(py).call_method0("__anext__")?.unbind()),
+    )
+    .await
 }
 
 async fn acquire_permit(
@@ -583,94 +561,60 @@ fn submit_spec(rt: &Bound<'_, Runtime>, py: Python<'_>, spec: &Py<Task>) -> PyRe
     )
 }
 
-struct StreamArgs {
-    inner: Arc<Inner>,
-    locals: TaskLocals,
-    func: PyValue,
-    args: Py<PyTuple>,
-    admission_permit: Option<OwnedSemaphorePermit>,
-    cancel: CancellationToken,
-    timeout: Option<Duration>,
-    py_task: SharedPyTask,
-    event_loop: PyValue,
-    slot: Arc<TaskSlot>,
+fn submit_all(
+    rt: &Bound<'_, Runtime>,
+    py: Python<'_>,
+    tasks: &Bound<'_, PyAny>,
+) -> PyResult<(TaskLocals, Vec<Handle>)> {
+    rt.get().inner.ensure_open()?;
+    let locals = get_current_locals(py)?;
+    let specs = extract_tasks(tasks)?;
+    let mut handles = Vec::with_capacity(specs.len());
+    for spec in specs {
+        handles.push(submit_spec(rt, py, &spec)?);
+    }
+    Ok((locals, handles))
+}
+
+fn handle_future(
+    py: Python<'_>,
+    locals: &TaskLocals,
+    handle: &Handle,
+) -> PyResult<impl Future<Output = PyValueResult> + Send + use<>> {
+    pyo3_async_runtimes::into_future_with_locals(locals, handle.clone_awaitable(py).into_bound(py))
+}
+
+fn indexed_set<F: Future>(
+    futs: impl IntoIterator<Item = F>,
+) -> FuturesUnordered<impl Future<Output = (usize, F::Output)>> {
+    futs.into_iter()
+        .enumerate()
+        .map(|(index, fut)| async move { (index, fut.await) })
+        .collect()
+}
+
+async fn run_stream_inner(
+    mut ctx: WorkCtx,
     tx: tokio::sync::mpsc::Sender<ItemResult>,
-}
-
-async fn run_stream(args: StreamArgs) -> PyResult<()> {
-    let slot = Arc::clone(&args.slot);
-    let inner = Arc::clone(&args.inner);
-    let result = run_stream_inner(args).await;
-    inner.journal.finish(
-        &slot,
-        match &result {
-            Ok(()) => TaskState::Succeeded,
-            Err(err) => state_for_err(err),
-        },
-    );
-    result
-}
-
-async fn run_stream_inner(args: StreamArgs) -> PyResult<()> {
-    let _admission = match args.admission_permit {
-        Some(permit) => permit,
-        None => acquire_permit(Arc::clone(&args.inner.admission), &args.cancel).await?,
-    };
-    let _concurrency = acquire_permit(Arc::clone(&args.inner.concurrency), &args.cancel).await?;
-    args.inner.journal.mark_running(&args.slot);
-
+) -> PyResult<()> {
+    let _permits = acquire_execution(&mut ctx).await?;
     let agen = Python::attach(|py| {
-        args.func
+        ctx.func
             .bind(py)
-            .call(args.args.bind(py), None)
+            .call(ctx.args.bind(py), None)
             .map(|value| value.unbind())
     })?;
 
     loop {
-        if args.cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             break Err(cancelled_error());
         }
-        if args.tx.is_closed() {
+        if tx.is_closed() {
             break Ok(());
         }
-
-        let started = Python::attach(|py| -> PyResult<_> {
-            let next = agen.bind(py).call_method0("__anext__")?;
-            let bridged = start_asyncio_task(py, &args.locals, next)?;
-            Ok((
-                bridged.task_rx,
-                bridged.result_rx,
-                args.event_loop.clone_ref(py),
-            ))
-        });
-        let (task_rx, result_rx, event_loop) = match started {
-            Ok(parts) => parts,
-            Err(err) => break Err(err),
-        };
-
-        let started = tokio::select! {
-            biased;
-            task = task_rx => task.ok(),
-            _ = args.cancel.cancelled() => None,
-        };
-        let Some(task) = started else {
-            break Err(cancelled_error());
-        };
-        if let Ok(mut slot) = args.py_task.lock() {
-            *slot = Some(task);
-        }
-
-        match wait_with_policy(
-            args.cancel.clone(),
-            args.timeout,
-            result_rx,
-            event_loop,
-            Arc::clone(&args.py_task),
-        )
-        .await
-        {
+        match await_anext(&ctx, &agen).await {
             Ok(item) => {
-                if args.tx.send(Ok(item)).await.is_err() {
+                if tx.send(Ok(item)).await.is_err() {
                     break Ok(());
                 }
             }
@@ -679,7 +623,7 @@ async fn run_stream_inner(args: StreamArgs) -> PyResult<()> {
                 if stop {
                     break Ok(());
                 }
-                let _ = args.tx.send(Err(err)).await;
+                let _ = tx.send(Err(err)).await;
                 break Ok(());
             }
         }
@@ -691,7 +635,11 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
         return;
     };
     get_runtime().spawn(async move {
-        if !wait_flag(&inner, || inner.ever_worked.load(Ordering::Acquire)).await {
+        if !wait_until(&inner, &inner.work_started, || {
+            inner.ever_worked.load(Ordering::Acquire)
+        })
+        .await
+        {
             return;
         }
         loop {
@@ -699,7 +647,11 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
                 return;
             }
             if inner.work_count.load(Ordering::Acquire) > 0 {
-                if !wait_idle_signal(&inner).await {
+                if !wait_until(&inner, &inner.became_idle, || {
+                    inner.work_count.load(Ordering::Acquire) == 0
+                })
+                .await
+                {
                     return;
                 }
                 continue;
@@ -707,7 +659,9 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
             tokio::select! {
                 biased;
                 _ = inner.shutdown.cancelled() => return,
-                _ = wait_work_started(&inner) => {}
+                _ = wait_until(&inner, &inner.work_started, || {
+                    inner.work_count.load(Ordering::Acquire) > 0
+                }) => {}
                 _ = tokio::time::sleep(ttl) => {
                     if inner.work_count.load(Ordering::Acquire) == 0 {
                         inner.closed.store(true, Ordering::Release);
@@ -720,47 +674,15 @@ fn spawn_idle_watcher(inner: Arc<Inner>) {
     });
 }
 
-async fn wait_flag(inner: &Inner, ready: impl Fn() -> bool) -> bool {
+async fn wait_until(inner: &Inner, notify: &Notify, ready: impl Fn() -> bool) -> bool {
     loop {
         if inner.is_closed() {
             return false;
         }
-        let notified = inner.work_started.notified();
+        let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         if ready() {
-            return true;
-        }
-        tokio::select! {
-            biased;
-            _ = inner.shutdown.cancelled() => return false,
-            _ = notified => {}
-        }
-    }
-}
-
-async fn wait_work_started(inner: &Inner) {
-    let notified = inner.work_started.notified();
-    tokio::pin!(notified);
-    notified.as_mut().enable();
-    if inner.work_count.load(Ordering::Acquire) > 0 {
-        return;
-    }
-    notified.await;
-}
-
-async fn wait_idle_signal(inner: &Inner) -> bool {
-    loop {
-        if inner.is_closed() {
-            return false;
-        }
-        if inner.work_count.load(Ordering::Acquire) == 0 {
-            return true;
-        }
-        let notified = inner.became_idle.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if inner.work_count.load(Ordering::Acquire) == 0 {
             return true;
         }
         tokio::select! {
