@@ -15,6 +15,8 @@ mod rust_python_lab {
     #[pymodule_export]
     use crate::error::QueueFull;
     #[pymodule_export]
+    use crate::error::RuntimeClosed;
+    #[pymodule_export]
     use crate::handle::Handle;
     #[pymodule_export]
     use crate::policy::OnFull;

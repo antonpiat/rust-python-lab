@@ -7,3 +7,10 @@ create_exception!(
     PyRuntimeError,
     "The runtime admission queue is full."
 );
+
+create_exception!(
+    rust_python_lab,
+    RuntimeClosed,
+    PyRuntimeError,
+    "The runtime is closed and no longer accepts work."
+);
